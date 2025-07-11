@@ -1,0 +1,93 @@
+from AlgorithmImports import *
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from datetime import timedelta
+
+class MomentumXGBoostAlgorithm(QCAlgorithm):
+
+    # ----------  CONFIGURABLE PARAMETERS ----------
+    symbol_str      = "SPY"
+    lookback_train  = 252          # 1 year
+    retrain_period  = 20           # retrain every 20 bars
+    threshold_long  = 0.003        # +0.3 %
+    threshold_short = -0.003       # –0.3 %
+    xgb_params      = {
+        "n_estimators": 200,
+        "max_depth": 3,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "objective": "reg:squarederror",
+        "reg_lambda": 1.0
+    }
+    # ----------------------------------------------
+
+    def Initialize(self):
+        self.SetStartDate(2021, 1, 1)
+        self.SetCash(100_000)
+        self.symbol = self.AddEquity(self.symbol_str, Resolution.Daily).Symbol
+
+        self.history = self.History(self.symbol, self.lookback_train + 25, Resolution.Daily)["close"].dropna()
+        self.model = None
+        self.next_retrain = self.Time
+        self.Schedule.On(self.DateRules.EveryDay(self.symbol),
+                         self.TimeRules.AfterMarketOpen(self.symbol, 1),
+                         self.PredictAndTrade)
+
+    # ---------- feature engineering ----------
+    @staticmethod
+    def build_features(close: pd.Series) -> pd.DataFrame:
+        df = pd.DataFrame({"close": close})
+        df["mom5"]  = df["close"].pct_change(5)
+        df["mom10"] = df["close"].pct_change(10)
+        df["mom20"] = df["close"].pct_change(20)
+        df["target"] = df["close"].shift(-5) / df["close"] - 1
+        return df
+
+    # ---------- model training ----------
+    def retrain_model(self):
+        hist = self.history[-(self.lookback_train + 25):]
+        df = self.build_features(hist)
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(df) < 20:
+            self.Debug("Not enough training samples, skipping retrain.")
+            return
+
+        X = df[["mom5", "mom10", "mom20"]].values
+        y = df["target"].values
+
+        self.model = xgb.XGBRegressor(**self.xgb_params)
+        self.model.fit(X, y)
+
+        self.Debug(f"{self.Time.date()}  XGB trained. In-sample R²: {self.model.score(X, y):.3f}")
+
+    # ---------- prediction + execution ----------
+    def PredictAndTrade(self):
+        latest_close = pd.Series([self.Securities[self.symbol].Close], name="close")
+        self.history = pd.concat([self.history, latest_close], ignore_index=True)
+
+        if len(self.history) > self.lookback_train + 25:
+            self.history = self.history.iloc[1:]
+
+        if self.Time >= self.next_retrain or self.model is None:
+            self.retrain_model()
+            self.next_retrain = self.Time + timedelta(days=self.retrain_period)
+
+        df_today = self.build_features(self.history).replace([np.inf, -np.inf], np.nan).dropna()
+        if df_today.empty:
+            self.Debug("No valid input row for prediction.")
+            return
+
+        X_today = df_today[["mom5", "mom10", "mom20"]].values[-1:]
+        prediction = float(self.model.predict(X_today))
+        self.Log(f"{self.Time.date()}  Predicted 5-day return: {prediction:.4%}")
+
+        qty = self.Portfolio[self.symbol].Quantity
+        if prediction > self.threshold_long and qty <= 0:
+            self.SetHoldings(self.symbol, 1.0)
+        elif prediction < self.threshold_short and qty >= 0:
+            self.SetHoldings(self.symbol, -1.0)
+        elif abs(prediction) < self.threshold_long / 2 and qty != 0:
+            self.Liquidate(self.symbol)
