@@ -1,0 +1,79 @@
+from AlgorithmImports import *
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import Ridge
+
+class MomentumRidgeRegressionAlgorithm(QCAlgorithm):
+
+    # ----------  CONFIGURABLE PARAMETERS ----------
+    symbol_str      = "SPY"      # Ticker to trade
+    lookback_train  = 252        # ~1 year of daily bars for training
+    retrain_period  = 20         # retrain every n trading days
+    threshold_long  = 0.003      # 0.3 % predicted 5-day return
+    threshold_short = -0.003     # −0.3 % predicted 5-day return
+    ridge_alpha     = 5.0        # L2 regularization strength
+    # ----------------------------------------------
+
+    def Initialize(self):
+        self.SetStartDate(2021, 1, 1)
+        self.SetCash(100_000)
+        self.symbol = self.AddEquity(self.symbol_str, Resolution.Daily).Symbol
+        
+        # Warm-up history to build initial training set
+        self.history = self.History(self.symbol, self.lookback_train + 25, Resolution.Daily)\
+                           .loc[self.symbol].dropna()
+        
+        self.model = None
+        self.next_retrain = self.Time    # retrain on first day
+        self.Schedule.On(self.DateRules.EveryDay(self.symbol),
+                         self.TimeRules.AfterMarketOpen(self.symbol, 1),
+                         self.PredictAndTrade)
+        
+    # -----------------  FEATURE ENGINEERING -----------------
+    @staticmethod
+    def build_features(close_series: pd.Series) -> pd.DataFrame:
+        df = pd.DataFrame({"close": close_series})
+        df["mom5"]  = df["close"].pct_change(5)
+        df["mom10"] = df["close"].pct_change(10)
+        df["mom20"] = df["close"].pct_change(20)
+        df["target"] = df["close"].shift(-5) / df["close"] - 1
+        return df.dropna()
+
+    # -----------------  MODEL TRAINING -----------------
+    def retrain_model(self):
+        # Get latest history window
+        hist = self.History(self.symbol, self.lookback_train + 25, Resolution.Daily)\
+                    .loc[self.symbol]["close"].dropna()
+        self.history = hist                              # store for later features
+        df = self.build_features(hist)
+        X = df[["mom5", "mom10", "mom20"]].values
+        y = df["target"].values
+        self.model = Ridge(alpha=self.ridge_alpha)
+        self.model.fit(X, y)
+        self.Debug(f"{self.Time.date()}  Model retrained. In-sample R²: {self.model.score(X, y):.3f}")
+
+    # -----------------  PREDICT & EXECUTE -----------------
+    def PredictAndTrade(self):
+        # Retrain if scheduled
+        if self.Time >= self.next_retrain or self.model is None:
+            self.retrain_model()
+            # schedule next retrain
+            self.next_retrain = self.Time + timedelta(days=self.retrain_period)
+
+        # Build today’s feature row
+        latest_close = pd.Series([self.Securities[self.symbol].Close], name="close")
+        hist = pd.concat([self.history, latest_close], ignore_index=True)
+        df = self.build_features(hist)[-1:]            # last available row
+        X_today = df[["mom5", "mom10", "mom20"]].values
+        
+        prediction = float(self.model.predict(X_today))
+        self.Log(f"{self.Time.date()}  Predicted 5-day return: {prediction:.4%}")
+        
+        # Trading logic
+        holdings = self.Portfolio[self.symbol].Quantity
+        if prediction > self.threshold_long and holdings <= 0:
+            self.SetHoldings(self.symbol, 1.0)   # go long
+        elif prediction < self.threshold_short and holdings >= 0:
+            self.SetHoldings(self.symbol, -1.0)  # go short
+        elif abs(prediction) < self.threshold_long / 2 and holdings != 0:
+            self.Liquidate(self.symbol)          # flatten on low conviction
